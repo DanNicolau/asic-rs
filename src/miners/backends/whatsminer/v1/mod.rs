@@ -500,6 +500,7 @@ impl GetPools for WhatsMinerV1 {
                     active,
                     alive,
                     user,
+                    password: None,
                 });
             }
         }

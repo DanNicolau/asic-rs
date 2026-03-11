@@ -507,6 +507,7 @@ impl GetPools for VnishV120 {
                     active,
                     alive,
                     user,
+                    password: None,
                 });
             }
         }
