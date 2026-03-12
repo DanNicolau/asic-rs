@@ -880,7 +880,26 @@ impl SetPowerLimit for AntMinerV2020 {
 #[async_trait]
 impl SetPools for AntMinerV2020 {
     fn supports_set_pools(&self) -> bool {
-        false
+        true
+    }
+
+    async fn set_pools(&self, config: Vec<crate::config::pools::PoolGroup>) -> anyhow::Result<bool> {
+        let pools: Vec<Value> = config
+            .into_iter()
+            .flat_map(|group| group.pools)
+            .map(|pool| {
+                json!({
+                    "url": pool.url.to_string(),
+                    "user": pool.username,
+                    "pass": pool.password,
+                })
+            })
+            .collect();
+
+        self.web
+            .set_miner_conf(json!({ "pools": pools }))
+            .await
+            .map(|_| true)
     }
 }
 
