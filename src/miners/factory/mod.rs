@@ -168,6 +168,7 @@ pub fn select_backend(
     model: MinerModel,
     firmware: Option<MinerFirmware>,
     version: Option<semver::Version>,
+    web_credentials: Option<&(String, String)>,
 ) -> Option<Box<dyn Miner>> {
     match (&model, firmware) {
         (MinerModel::WhatsMiner(_), Some(MinerFirmware::Stock)) => {
@@ -183,7 +184,10 @@ pub fn select_backend(
             Some(AvalonMiner::new(ip, model, version))
         }
         (MinerModel::AntMiner(_), Some(MinerFirmware::Stock)) => {
-            Some(AntMiner::new(ip, model, version))
+            Some(match web_credentials {
+                Some((user, pass)) => AntMiner::new_with_auth(ip, model, version, user.clone(), pass.clone()),
+                None => AntMiner::new(ip, model, version),
+            })
         }
         (_, Some(MinerFirmware::VNish)) => Some(Vnish::new(ip, model, version)),
         (_, Some(MinerFirmware::EPic)) => Some(PowerPlay::new(ip, model, version)),
@@ -207,6 +211,9 @@ pub struct MinerFactory {
     connectivity_retries: u32,
     concurrent: Option<usize>,
     check_port: bool,
+    /// Optional web credentials (username, password) to pass to backends that
+    /// require authenticated HTTP access (e.g. AntMiner Digest auth).
+    web_credentials: Option<(String, String)>,
 }
 
 impl Default for MinerFactory {
@@ -346,19 +353,20 @@ impl MinerFactory {
                     model,
                     Some(MinerFirmware::Stock),
                     version,
+                    self.web_credentials.as_ref(),
                 ))
             }
             Some((_, Some(firmware))) => {
                 let model = firmware.get_model(ip).await?;
                 let version = firmware.get_version(ip).await;
 
-                Ok(select_backend(ip, model, Some(firmware), version))
+                Ok(select_backend(ip, model, Some(firmware), version, self.web_credentials.as_ref()))
             }
             Some((Some(make), firmware)) => {
                 let model = make.get_model(ip).await?;
                 let version = make.get_version(ip).await;
 
-                Ok(select_backend(ip, model, firmware, version))
+                Ok(select_backend(ip, model, firmware, version, self.web_credentials.as_ref()))
             }
             _ => {
                 tracing::debug!("failed to identify {ip}");
@@ -377,7 +385,15 @@ impl MinerFactory {
             connectivity_retries: CONNECTIVITY_RETRIES,
             concurrent: None,
             check_port: true, // Enable port checking by default
+            web_credentials: None,
         }
+    }
+
+    /// Provide web credentials (username, password) to use when authenticating
+    /// with miner web APIs (e.g. AntMiner Digest auth on `get_miner_conf.cgi`).
+    pub fn with_web_credentials(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
+        self.web_credentials = Some((username.into(), password.into()));
+        self
     }
 
     // Port checking
