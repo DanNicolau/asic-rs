@@ -99,6 +99,7 @@ use asic_rs::MinerFactory;
 async fn main() -> anyhow::Result<()> {
     let miners = MinerFactory::from_subnet("192.168.1.0/24")?
         .with_concurrent_limit(2500)
+        .with_connectivity_concurrent_limit(5000)
         .scan()
         .await?;
 
@@ -119,6 +120,7 @@ async def main() -> None:
     miners = await (
         MinerFactory.from_subnet("192.168.1.0/24")
         .with_concurrent_limit(2500)
+        .with_connectivity_concurrent_limit(5000)
         .scan()
     )
 

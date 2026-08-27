@@ -322,15 +322,28 @@ impl MinerFactory {
         Self::try_update_inner(slf, |inner| inner.with_range(range))
     }
 
-    /// Set the maximum number of addresses scanned concurrently.
+    /// Set the maximum number of miners identified concurrently.
     ///
-    /// This also caps active TCP connectivity probes across the scan.
+    /// TCP connectivity probes inherit this limit unless configured
+    /// independently with `with_connectivity_concurrent_limit`.
     pub fn with_concurrent_limit<'py>(
         slf: PyRefMut<'py, Self>,
         limit: usize,
     ) -> PyResult<PyRefMut<'py, Self>> {
         Ok(Self::update_inner(slf, |inner| {
             inner.with_concurrent_limit(limit)
+        }))
+    }
+
+    /// Set the maximum number of active TCP connectivity probes.
+    ///
+    /// All port probes and connectivity retries share this limit.
+    pub fn with_connectivity_concurrent_limit<'py>(
+        slf: PyRefMut<'py, Self>,
+        limit: usize,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        Ok(Self::update_inner(slf, |inner| {
+            inner.with_connectivity_concurrent_limit(limit)
         }))
     }
 

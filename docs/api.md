@@ -13,8 +13,10 @@ under the same scan concurrency limit. The default remains three retries;
 callers that want one pass can explicitly set zero.
 
 Common miner ports are probed concurrently, returning after the first success.
-The scan concurrency limit also bounds the total number of active TCP probes,
-including probes made by connectivity retries.
+By default the scan concurrency limit also bounds the total number of active
+TCP probes. Callers can tune the lightweight TCP phase independently with
+`with_connectivity_concurrent_limit`; connectivity retries share that same
+limit.
 
 The identification timeout is an end-to-end deadline covering discovery
 commands and firmware-specific miner construction. Discovery HTTP clients also
@@ -25,6 +27,7 @@ apply explicit connection and total-request deadlines.
     ```rust
     let factory = MinerFactory::from_subnet("192.168.1.0/24")?
         .with_concurrent_limit(2500)
+        .with_connectivity_concurrent_limit(5000)
         .with_connectivity_timeout_secs(1)
         .with_connectivity_retries(0)
         .with_identification_timeout_secs(10);
@@ -36,6 +39,7 @@ apply explicit connection and total-request deadlines.
     factory = (
         MinerFactory.from_subnet("192.168.1.0/24")
         .with_concurrent_limit(2500)
+        .with_connectivity_concurrent_limit(5000)
         .with_connectivity_timeout_secs(1)
         .with_connectivity_retries(0)
         .with_identification_timeout_secs(10)

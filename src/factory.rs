@@ -308,6 +308,7 @@ pub struct MinerFactory {
     identification_timeout: Duration,
     connectivity_timeout: Duration,
     connectivity_retries: u32,
+    connectivity_concurrent: Option<usize>,
     concurrent: Option<usize>,
     nofile_limit: Option<u64>,
     nofile_adjustment: bool,
@@ -329,6 +330,7 @@ impl std::fmt::Debug for MinerFactory {
             .field("identification_timeout", &self.identification_timeout)
             .field("connectivity_timeout", &self.connectivity_timeout)
             .field("connectivity_retries", &self.connectivity_retries)
+            .field("connectivity_concurrent", &self.connectivity_concurrent)
             .field("concurrent", &self.concurrent)
             .field("nofile_limit", &self.nofile_limit)
             .field("nofile_adjustment", &self.nofile_adjustment)
@@ -344,11 +346,21 @@ impl Default for MinerFactory {
 }
 
 impl MinerFactory {
+    fn concurrency_limits(&self, ip_count: usize) -> (usize, usize) {
+        let identification = self
+            .concurrent
+            .unwrap_or(calculate_optimal_concurrency(ip_count.max(1)))
+            .max(1);
+        let connectivity = self
+            .connectivity_concurrent
+            .unwrap_or(identification)
+            .max(1);
+        (identification, connectivity)
+    }
+
     #[tracing::instrument(level = "debug", skip(self))]
     pub async fn scan_miner(&self, ip: IpAddr) -> Result<Option<Box<dyn Miner>>> {
-        let connection_limit = self
-            .concurrent
-            .unwrap_or(calculate_optimal_concurrency(self.ips.len().max(1)));
+        let (_, connection_limit) = self.concurrency_limits(self.ips.len());
         self.scan_miner_with_connection_limit(ip, Arc::new(Semaphore::new(connection_limit.max(1))))
             .await
     }
@@ -490,6 +502,7 @@ impl MinerFactory {
             identification_timeout: IDENTIFICATION_TIMEOUT,
             connectivity_timeout: CONNECTIVITY_TIMEOUT,
             connectivity_retries: CONNECTIVITY_RETRIES,
+            connectivity_concurrent: None,
             concurrent: None,
             nofile_limit: None,
             nofile_adjustment: true,
@@ -519,12 +532,22 @@ impl MinerFactory {
         self
     }
 
-    /// Set the maximum number of addresses scanned at the same time.
+    /// Set the maximum number of miners identified concurrently.
     ///
-    /// This also caps active TCP connectivity probes across the scan. If unset,
-    /// scan concurrency is chosen from the number of queued hosts.
+    /// If unset, identification concurrency is chosen from the number of queued
+    /// hosts. TCP connectivity probes inherit this limit unless overridden by
+    /// [`Self::with_connectivity_concurrent_limit`].
     pub fn with_concurrent_limit(mut self, limit: usize) -> Self {
         self.concurrent = Some(limit);
+        self
+    }
+
+    /// Set the maximum number of active TCP connectivity probes.
+    ///
+    /// All port probes and connectivity retries share this limit. If unset,
+    /// connectivity inherits the miner-identification concurrency limit.
+    pub fn with_connectivity_concurrent_limit(mut self, limit: usize) -> Self {
+        self.connectivity_concurrent = Some(limit.max(1));
         self
     }
 
@@ -777,18 +800,16 @@ impl MinerFactory {
             ));
         }
 
-        let concurrency = self
-            .concurrent
-            .unwrap_or(calculate_optimal_concurrency(self.ips.len()));
+        let (concurrency, connectivity_concurrency) = self.concurrency_limits(self.ips.len());
 
         if let Some(desired_nofile) = self.nofile_limit.or_else(|| {
             self.nofile_adjustment
-                .then(|| calculate_desired_nofile_limit(concurrency))
+                .then(|| calculate_desired_nofile_limit(concurrency.max(connectivity_concurrency)))
         }) {
             maybe_adjust_nofile_limit(desired_nofile);
         }
 
-        let connection_limit = Arc::new(Semaphore::new(concurrency.max(1)));
+        let connection_limit = Arc::new(Semaphore::new(connectivity_concurrency));
         let miners: Vec<Box<dyn Miner>> = stream::iter(self.ips.iter().copied())
             .map(|ip| {
                 let connection_limit = Arc::clone(&connection_limit);
@@ -812,20 +833,18 @@ impl MinerFactory {
     /// Use this when callers should process miners as soon as they are found
     /// instead of waiting for the full scan to finish.
     pub fn scan_stream(&self) -> Pin<Box<impl Stream<Item = Box<dyn Miner>> + Send + use<>>> {
-        let concurrency = self
-            .concurrent
-            .unwrap_or(calculate_optimal_concurrency(self.ips.len()));
+        let (concurrency, connectivity_concurrency) = self.concurrency_limits(self.ips.len());
 
         if let Some(desired_nofile) = self.nofile_limit.or_else(|| {
             self.nofile_adjustment
-                .then(|| calculate_desired_nofile_limit(concurrency))
+                .then(|| calculate_desired_nofile_limit(concurrency.max(connectivity_concurrency)))
         }) {
             maybe_adjust_nofile_limit(desired_nofile);
         }
 
         let factory = Arc::new(self.clone());
         let ips: Arc<[IpAddr]> = Arc::from(self.ips.as_slice());
-        let connection_limit = Arc::new(Semaphore::new(concurrency.max(1)));
+        let connection_limit = Arc::new(Semaphore::new(connectivity_concurrency));
 
         let ip_count = ips.len();
         let stream = stream::iter(0..ip_count)
@@ -855,20 +874,18 @@ impl MinerFactory {
     pub fn scan_stream_with_ip(
         &self,
     ) -> Pin<Box<impl Stream<Item = (IpAddr, Option<Box<dyn Miner>>)> + Send + use<>>> {
-        let concurrency = self
-            .concurrent
-            .unwrap_or(calculate_optimal_concurrency(self.ips.len()));
+        let (concurrency, connectivity_concurrency) = self.concurrency_limits(self.ips.len());
 
         if let Some(desired_nofile) = self.nofile_limit.or_else(|| {
             self.nofile_adjustment
-                .then(|| calculate_desired_nofile_limit(concurrency))
+                .then(|| calculate_desired_nofile_limit(concurrency.max(connectivity_concurrency)))
         }) {
             maybe_adjust_nofile_limit(desired_nofile);
         }
 
         let factory = Arc::new(self.clone());
         let ips: Arc<[IpAddr]> = Arc::from(self.ips.as_slice());
-        let connection_limit = Arc::new(Semaphore::new(concurrency.max(1)));
+        let connection_limit = Arc::new(Semaphore::new(connectivity_concurrency));
 
         let ip_count = ips.len();
         let stream = stream::iter(0..ip_count)
@@ -1202,6 +1219,29 @@ mod tests {
     #[test]
     fn connectivity_retry_default_preserves_upstream_value() {
         assert_eq!(MinerFactory::new().connectivity_retries, 3);
+    }
+
+    #[test]
+    fn connectivity_concurrency_inherits_identification_limit_by_default() {
+        let factory = MinerFactory::new().with_concurrent_limit(17);
+
+        assert_eq!(factory.concurrency_limits(100), (17, 17));
+    }
+
+    #[test]
+    fn connectivity_concurrency_can_be_configured_independently() {
+        let factory = MinerFactory::new()
+            .with_concurrent_limit(17)
+            .with_connectivity_concurrent_limit(43);
+
+        assert_eq!(factory.concurrency_limits(100), (17, 43));
+    }
+
+    #[test]
+    fn connectivity_concurrency_clamps_zero_to_one() {
+        let factory = MinerFactory::new().with_connectivity_concurrent_limit(0);
+
+        assert_eq!(factory.connectivity_concurrent, Some(1));
     }
 
     #[test]
