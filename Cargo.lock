@@ -90,6 +90,7 @@ dependencies = [
  "asic-rs-makes-whatsminer",
  "asic-rs-pydantic",
  "async-stream",
+ "async-trait",
  "futures",
  "ipnet",
  "measurements",

@@ -284,6 +284,9 @@ pyo3-log = {workspace = true, optional = true}
 [build-dependencies]
 pyo3-build-config.workspace = true
 
+[dev-dependencies]
+async-trait.workspace = true
+
 [lints]
 workspace = true
 
