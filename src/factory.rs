@@ -293,6 +293,31 @@ pub fn default_firmware_registry() -> Vec<Arc<dyn FirmwareEntry>> {
 }
 
 #[derive(Clone)]
+struct DiscoveryPlan {
+    registry: Arc<[Arc<dyn FirmwareEntry>]>,
+    commands: Arc<[MinerCommand]>,
+}
+
+impl DiscoveryPlan {
+    fn new(registry: Vec<Arc<dyn FirmwareEntry>>) -> Self {
+        let registry: Arc<[Arc<dyn FirmwareEntry>]> = registry.into();
+        let mut seen = HashSet::new();
+        let mut commands = Vec::new();
+        for firmware in registry.iter() {
+            for command in firmware.get_discovery_commands() {
+                if seen.insert(command.clone()) {
+                    commands.push(command);
+                }
+            }
+        }
+        Self {
+            registry,
+            commands: commands.into(),
+        }
+    }
+}
+
+#[derive(Clone)]
 /// Discovers ASIC miners and constructs firmware-specific miner handles.
 ///
 /// A factory owns the IP addresses to scan, the firmware registry used for
@@ -346,6 +371,14 @@ impl Default for MinerFactory {
 }
 
 impl MinerFactory {
+    fn discovery_plan(&self) -> DiscoveryPlan {
+        DiscoveryPlan::new(
+            self.search_firmwares
+                .clone()
+                .unwrap_or_else(default_firmware_registry),
+        )
+    }
+
     fn concurrency_limits(&self, ip_count: usize) -> (usize, usize) {
         let identification = self
             .concurrent
@@ -361,17 +394,22 @@ impl MinerFactory {
     #[tracing::instrument(level = "debug", skip(self))]
     pub async fn scan_miner(&self, ip: IpAddr) -> Result<Option<Box<dyn Miner>>> {
         let (_, connection_limit) = self.concurrency_limits(self.ips.len());
-        self.scan_miner_with_connection_limit(ip, Arc::new(Semaphore::new(connection_limit.max(1))))
-            .await
+        self.scan_miner_with_resources(
+            ip,
+            Arc::new(Semaphore::new(connection_limit.max(1))),
+            Arc::new(self.discovery_plan()),
+        )
+        .await
     }
 
-    async fn scan_miner_with_connection_limit(
+    async fn scan_miner_with_resources(
         &self,
         ip: IpAddr,
         connection_limit: Arc<Semaphore>,
+        discovery_plan: Arc<DiscoveryPlan>,
     ) -> Result<Option<Box<dyn Miner>>> {
         if !self.check_port {
-            return self.get_miner(ip).await;
+            return self.get_miner_with_plan(ip, discovery_plan).await;
         }
         if retry_connectivity(
             self.connectivity_retries,
@@ -380,7 +418,7 @@ impl MinerFactory {
         )
         .await
         {
-            return self.get_miner(ip).await;
+            return self.get_miner_with_plan(ip, discovery_plan).await;
         }
         tracing::trace!("no response from any miner-specific ports");
         Ok(None)
@@ -390,9 +428,18 @@ impl MinerFactory {
     ///
     /// Uses backend default credentials during discovery/build unless
     /// overridden via [`Self::with_firmware_discovery_auth`].
-    #[tracing::instrument(level = "debug", skip(self))]
     pub async fn get_miner(&self, ip: IpAddr) -> Result<Option<Box<dyn Miner>>> {
-        let discovery = AssertUnwindSafe(self.get_miner_inner(ip)).catch_unwind();
+        self.get_miner_with_plan(ip, Arc::new(self.discovery_plan()))
+            .await
+    }
+
+    #[tracing::instrument(name = "get_miner", level = "debug", skip(self, discovery_plan))]
+    async fn get_miner_with_plan(
+        &self,
+        ip: IpAddr,
+        discovery_plan: Arc<DiscoveryPlan>,
+    ) -> Result<Option<Box<dyn Miner>>> {
+        let discovery = AssertUnwindSafe(self.get_miner_inner(ip, discovery_plan)).catch_unwind();
         match timeout(self.identification_timeout, discovery).await {
             Ok(Ok(result)) => result,
             Ok(Err(panic_info)) => {
@@ -412,24 +459,15 @@ impl MinerFactory {
         }
     }
 
-    async fn get_miner_inner(&self, ip: IpAddr) -> Result<Option<Box<dyn Miner>>> {
-        let registry: Arc<[Arc<dyn FirmwareEntry>]> = Arc::from(
-            self.search_firmwares
-                .clone()
-                .unwrap_or_else(default_firmware_registry)
-                .as_slice(),
-        );
-
+    async fn get_miner_inner(
+        &self,
+        ip: IpAddr,
+        discovery_plan: Arc<DiscoveryPlan>,
+    ) -> Result<Option<Box<dyn Miner>>> {
+        let registry = Arc::clone(&discovery_plan.registry);
         let found = {
-            let mut commands: HashSet<MinerCommand> = HashSet::new();
-            for fw in registry.iter() {
-                for cmd in fw.get_discovery_commands() {
-                    commands.insert(cmd);
-                }
-            }
-
             let mut discovery_tasks = FuturesUnordered::new();
-            for command in commands {
+            for command in discovery_plan.commands.iter().cloned() {
                 let reg = registry.clone();
                 discovery_tasks.push(get_miner_type_from_command_catch_unwind(ip, command, reg));
             }
@@ -810,11 +848,13 @@ impl MinerFactory {
         }
 
         let connection_limit = Arc::new(Semaphore::new(connectivity_concurrency));
+        let discovery_plan = Arc::new(self.discovery_plan());
         let miners: Vec<Box<dyn Miner>> = stream::iter(self.ips.iter().copied())
             .map(|ip| {
                 let connection_limit = Arc::clone(&connection_limit);
+                let discovery_plan = Arc::clone(&discovery_plan);
                 async move {
-                    self.scan_miner_with_connection_limit(ip, connection_limit)
+                    self.scan_miner_with_resources(ip, connection_limit, discovery_plan)
                         .await
                         .ok()
                         .flatten()
@@ -845,6 +885,7 @@ impl MinerFactory {
         let factory = Arc::new(self.clone());
         let ips: Arc<[IpAddr]> = Arc::from(self.ips.as_slice());
         let connection_limit = Arc::new(Semaphore::new(connectivity_concurrency));
+        let discovery_plan = Arc::new(self.discovery_plan());
 
         let ip_count = ips.len();
         let stream = stream::iter(0..ip_count)
@@ -852,9 +893,10 @@ impl MinerFactory {
                 let factory = Arc::clone(&factory);
                 let ips = Arc::clone(&ips);
                 let connection_limit = Arc::clone(&connection_limit);
+                let discovery_plan = Arc::clone(&discovery_plan);
                 async move {
                     factory
-                        .scan_miner_with_connection_limit(ips[i], connection_limit)
+                        .scan_miner_with_resources(ips[i], connection_limit, discovery_plan)
                         .await
                         .ok()
                         .flatten()
@@ -886,6 +928,7 @@ impl MinerFactory {
         let factory = Arc::new(self.clone());
         let ips: Arc<[IpAddr]> = Arc::from(self.ips.as_slice());
         let connection_limit = Arc::new(Semaphore::new(connectivity_concurrency));
+        let discovery_plan = Arc::new(self.discovery_plan());
 
         let ip_count = ips.len();
         let stream = stream::iter(0..ip_count)
@@ -893,11 +936,12 @@ impl MinerFactory {
                 let factory = Arc::clone(&factory);
                 let ips = Arc::clone(&ips);
                 let connection_limit = Arc::clone(&connection_limit);
+                let discovery_plan = Arc::clone(&discovery_plan);
                 async move {
                     (
                         ips[i],
                         factory
-                            .scan_miner_with_connection_limit(ips[i], connection_limit)
+                            .scan_miner_with_resources(ips[i], connection_limit, discovery_plan)
                             .await
                             .ok()
                             .flatten(),
@@ -999,7 +1043,95 @@ fn generate_ips_from_ranges(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use asic_rs_core::{
+        errors::ModelSelectionError,
+        traits::{discovery::DiscoveryCommands, identification::FirmwareIdentification},
+    };
+    use async_trait::async_trait;
+    use std::{
+        fmt::{Display, Formatter},
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    #[derive(Debug)]
+    struct TestFirmware {
+        name: &'static str,
+        commands: Vec<MinerCommand>,
+        command_requests: Arc<AtomicUsize>,
+    }
+
+    impl Display for TestFirmware {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(self.name)
+        }
+    }
+
+    impl FirmwareIdentification for TestFirmware {}
+
+    impl DiscoveryCommands for TestFirmware {
+        fn get_discovery_commands(&self) -> Vec<MinerCommand> {
+            self.command_requests.fetch_add(1, Ordering::SeqCst);
+            self.commands.clone()
+        }
+    }
+
+    #[async_trait]
+    impl FirmwareEntry for TestFirmware {
+        async fn build_miner(
+            &self,
+            _ip: IpAddr,
+            _auth: Option<&MinerAuth>,
+        ) -> Result<Box<dyn Miner>, ModelSelectionError> {
+            Err(ModelSelectionError::NoModelResponse)
+        }
+    }
+
+    #[test]
+    fn discovery_plan_builds_registry_and_commands_once_in_stable_order() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let shared = MinerCommand::RPC {
+            command: "version",
+            parameters: None,
+        };
+        let web = MinerCommand::WebAPI {
+            command: "/",
+            parameters: None,
+        };
+        let second_rpc = MinerCommand::RPC {
+            command: "devdetails",
+            parameters: None,
+        };
+        let registry: Vec<Arc<dyn FirmwareEntry>> = vec![
+            Arc::new(TestFirmware {
+                name: "first",
+                commands: vec![shared.clone(), web.clone()],
+                command_requests: Arc::clone(&requests),
+            }),
+            Arc::new(TestFirmware {
+                name: "second",
+                commands: vec![shared.clone(), second_rpc.clone()],
+                command_requests: Arc::clone(&requests),
+            }),
+        ];
+
+        let plan = DiscoveryPlan::new(registry);
+
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            plan.registry
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert_eq!(plan.commands.as_ref(), [shared, web, second_rpc]);
+
+        for _ in 0..1000 {
+            let _commands = Arc::clone(&plan.commands);
+            let _registry = Arc::clone(&plan.registry);
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
 
     #[tokio::test]
     async fn port_race_checks_every_port_when_none_succeed() {

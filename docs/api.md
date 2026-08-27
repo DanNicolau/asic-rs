@@ -22,6 +22,10 @@ The identification timeout is an end-to-end deadline covering discovery
 commands and firmware-specific miner construction. Discovery HTTP clients also
 apply explicit connection and total-request deadlines.
 
+For bulk scans, the enabled firmware registry and its deduplicated discovery
+commands are prepared once and shared by all address tasks. Custom firmware
+registry order is preserved.
+
 === "Rust"
 
     ```rust
